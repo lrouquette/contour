@@ -14,7 +14,6 @@
 package contour
 
 import (
-	"path"
 	"sort"
 	"sync"
 	"time"
@@ -25,6 +24,7 @@ import (
 	envoy_api_v2_accesslog "github.com/envoyproxy/go-control-plane/envoy/config/filter/accesslog/v2"
 	resource "github.com/envoyproxy/go-control-plane/pkg/resource/v2"
 	"github.com/golang/protobuf/proto"
+	"github.com/google/go-cmp/cmp"
 	"github.com/projectcontour/contour/internal/dag"
 	"github.com/projectcontour/contour/internal/envoy"
 	"github.com/projectcontour/contour/internal/protobuf"
@@ -84,6 +84,10 @@ type ListenerVisitorConfig struct {
 	// HTTP and HTTPS listeners but has practical effect only for
 	// HTTPS, because we don't support h2c.
 	DefaultHTTPVersions []envoy.HTTPVersionType
+
+	// DefaultCertificate is the cert to use for the catch-all server
+	// if defined, it should be an existing secret of type kubernetes.io/tls
+	DefaultCertificate string
 
 	// AccessLogType defines if Envoy logs should be output as Envoy's default or JSON.
 	// Valid values: 'envoy', 'json'
@@ -221,11 +225,8 @@ type ListenerCache struct {
 
 // NewListenerCache returns an instance of a ListenerCache
 func NewListenerCache(address string, port int) ListenerCache {
-	stats := envoy.StatsListener(address, port)
 	return ListenerCache{
-		staticValues: map[string]*v2.Listener{
-			stats.Name: stats,
-		},
+		staticValues: map[string]*v2.Listener{},
 	}
 }
 
@@ -295,7 +296,7 @@ func visitListeners(root dag.Vertex, lvc *ListenerVisitorConfig) map[string]*v2.
 				ENVOY_HTTPS_LISTENER,
 				lvc.httpsAddress(),
 				lvc.httpsPort(),
-				secureProxyProtocol(lvc.UseProxyProto),
+				append(secureProxyProtocol(lvc.UseProxyProto), CustomListenerFilters()...),
 			),
 		},
 	}
@@ -317,9 +318,36 @@ func visitListeners(root dag.Vertex, lvc *ListenerVisitorConfig) map[string]*v2.
 			ENVOY_HTTP_LISTENER,
 			lvc.httpAddress(),
 			lvc.httpPort(),
-			proxyProtocol(lvc.UseProxyProto),
+			append(proxyProtocol(lvc.UseProxyProto), CustomListenerFilters()...),
 			cm,
 		)
+	}
+
+	// Configure a default/catch all filterchain if a DefaultCertificate exists
+	// setting "server_names" to a blank string will catch clients that don't send SNI
+	// https://www.envoyproxy.io/docs/envoy/v1.13.1/api-v2/api/v2/listener/listener_components.proto#listener-filterchainmatch
+	if lv.ListenerVisitorConfig.DefaultCertificate != "" {
+		secrets := visitSecretsAsDag(root)
+		if secret, ok := secrets[lv.ListenerVisitorConfig.DefaultCertificate]; ok {
+			// filters & alpnProtos are exactly as in visit() below
+			filters := envoy.Filters(
+				envoy.HTTPConnectionManagerBuilder().
+					DefaultFilters().
+					RouteConfigName(ENVOY_HTTPS_LISTENER).
+					MetricsPrefix(ENVOY_HTTPS_LISTENER).
+					AccessLoggers(lv.ListenerVisitorConfig.newSecureAccessLog()).
+					RequestTimeout(lv.ListenerVisitorConfig.requestTimeout()).
+					Get(),
+			)
+			alpnProtos := []string{"h2", "http/1.1"}
+
+			fcNoSNI := envoy.FilterChainTLS(
+				"", // no "server_names"
+				envoy.DownstreamTLSContext(secret, lv.ListenerVisitorConfig.minTLSVersion(), nil, alpnProtos...),
+				filters,
+			)
+			lv.listeners[ENVOY_HTTPS_LISTENER].FilterChains = append(lv.listeners[ENVOY_HTTPS_LISTENER].FilterChains, fcNoSNI)
+		}
 	}
 
 	// Remove the https listener if there are no vhosts bound to it.
@@ -376,9 +404,11 @@ func (v *listenerVisitor) visit(vertex dag.Vertex) {
 			filters = envoy.Filters(
 				envoy.HTTPConnectionManagerBuilder().
 					Codec(envoy.CodecForVersions(v.DefaultHTTPVersions...)).
-					AddFilter(envoy.FilterMisdirectedRequests(vh.VirtualHost.Name)).
+					// Adobe - no sni bindings, no lua filter
+					// AddFilter(envoy.FilterMisdirectedRequests(vh.VirtualHost.Name)).
 					DefaultFilters().
-					RouteConfigName(path.Join("https", vh.VirtualHost.Name)).
+					// RouteConfigName(path.Join("https", vh.VirtualHost.Name)).
+					RouteConfigName(ENVOY_HTTPS_LISTENER).
 					MetricsPrefix(ENVOY_HTTPS_LISTENER).
 					AccessLoggers(v.ListenerVisitorConfig.newSecureAccessLog()).
 					RequestTimeout(v.ListenerVisitorConfig.requestTimeout()).
@@ -405,15 +435,42 @@ func (v *listenerVisitor) visit(vertex dag.Vertex) {
 			// Choose the higher of the configured or requested TLS version.
 			vers := max(v.ListenerVisitorConfig.minTLSVersion(), vh.MinTLSVersion)
 
-			downstreamTLS = envoy.DownstreamTLSContext(
+			downstreamTLS = envoy.DownstreamTLSContextAdobe(
 				vh.Secret,
 				vers,
+				maxProtoVersion(vh.MaxProtoVersion),
 				vh.DownstreamValidation,
 				alpnProtos...)
 		}
 
-		v.listeners[ENVOY_HTTPS_LISTENER].FilterChains = append(v.listeners[ENVOY_HTTPS_LISTENER].FilterChains,
-			envoy.FilterChainTLS(vh.VirtualHost.Name, downstreamTLS, filters))
+		// Group filter chain by TransportSocket
+		// if a filter chain with the exact same DownstreamTlsContext already exists, just
+		// add the vhost name to the existing list
+		// EXCEPTION: don't group if TCPProxy filter exists (client-provided)
+		fcExists := false
+		if vh.TCPProxy == nil && vh.Secret != nil {
+			for _, fc := range v.listeners[ENVOY_HTTPS_LISTENER].FilterChains {
+				if fc.TransportSocket == nil {
+					// No TransportSocket, skip
+					continue
+				}
+				if isTCPProxyFilter(fc.Filters) {
+					// TCPProxy filter exists, skip
+					continue
+				}
+				if cmp.Equal(downstreamTLS, envoy.GetDownstreamTLSContext(fc)) {
+					fc.FilterChainMatch.ServerNames = append(fc.FilterChainMatch.ServerNames, vh.VirtualHost.Name)
+					sort.Strings(fc.FilterChainMatch.ServerNames)
+					fcExists = true
+					break
+				}
+			}
+		}
+
+		if !fcExists {
+			v.listeners[ENVOY_HTTPS_LISTENER].FilterChains = append(v.listeners[ENVOY_HTTPS_LISTENER].FilterChains,
+				envoy.FilterChainTLS(vh.VirtualHost.Name, downstreamTLS, filters))
+		}
 
 		// If this VirtualHost has enabled the fallback certificate then set a default
 		// FilterChain which will allow routes with this vhost to accept non-SNI TLS requests.

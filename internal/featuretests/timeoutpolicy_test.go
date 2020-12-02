@@ -29,6 +29,8 @@ import (
 )
 
 func TestTimeoutPolicyRequestTimeout(t *testing.T) {
+	// Adobe - we override with our own
+	t.SkipNow()
 	rh, c, done := setup(t, func(reh *contour.EventHandler) {})
 	defer done()
 
@@ -263,6 +265,8 @@ func TestTimeoutPolicyRequestTimeout(t *testing.T) {
 }
 
 func TestTimeoutPolicyIdleTimeout(t *testing.T) {
+	// Adobe - we override with our own
+	t.SkipNow()
 	rh, c, done := setup(t, func(reh *contour.EventHandler) {})
 	defer done()
 

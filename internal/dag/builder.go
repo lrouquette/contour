@@ -65,6 +65,8 @@ func (b *Builder) Build() *DAG {
 
 	b.computeIngresses()
 
+	b.computeIngressRoutes()
+
 	b.computeHTTPProxies()
 
 	return b.buildDAG()
@@ -293,6 +295,20 @@ func (b *Builder) delegationPermitted(secret k8s.FullName, to string) bool {
 			}
 		}
 	}
+
+	for _, d := range b.Source.irdelegations {
+		if d.Namespace != secret.Namespace {
+			continue
+		}
+		for _, d := range d.Spec.Delegations {
+			if contains(d.TargetNamespaces, to) {
+				if secret.Name == d.SecretName {
+					return true
+				}
+			}
+		}
+	}
+
 	return false
 }
 
@@ -816,7 +832,8 @@ func determineSNI(routeRequestHeaders *HeadersPolicy, clusterRequestHeaders *Hea
 func escapeHeaderValue(value string) string {
 	// Envoy supports %-encoded variables, so literal %'s in the header's value must be escaped.  See:
 	// https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_conn_man/headers#custom-request-response-headers
-	return strings.Replace(value, "%", "%%", -1)
+	ret := strings.Replace(value, "%", "%%", -1)
+	return strings.Replace(ret, "__percent__", "%", -1)
 }
 
 func includeConditionsIdentical(includes []projcontour.Include) bool {
@@ -850,6 +867,13 @@ func (b *Builder) buildDAG() *DAG {
 	}
 
 	for meta := range b.orphaned {
+		ir, ok := b.Source.ingressroutes[meta]
+		if ok {
+			sw, commit := b.WithObject(ir)
+			sw.WithValue("status", k8s.StatusOrphaned).
+				WithValue("description", "this IngressRoute is not part of a delegation chain from a root IngressRoute")
+			commit()
+		}
 		proxy, ok := b.Source.httpproxies[meta]
 		if ok {
 			sw, commit := b.WithObject(proxy)

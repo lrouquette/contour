@@ -17,6 +17,8 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/projectcontour/contour/adobe"
+
 	projcontour "github.com/projectcontour/contour/apis/projectcontour/v1"
 	"github.com/projectcontour/contour/internal/assert"
 	"github.com/projectcontour/contour/internal/k8s"
@@ -2120,7 +2122,11 @@ func TestDAGStatus(t *testing.T) {
 					FieldLogger:    testLogger(t),
 				},
 			}
+			if adobe.ShouldSkipTest(name) {
+				t.SkipNow()
+			}
 			for _, o := range tc.objs {
+				adobe.AdobefyObject(o)
 				builder.Source.Insert(o)
 			}
 			dag := builder.Build()

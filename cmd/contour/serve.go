@@ -170,17 +170,18 @@ func doServe(log logrus.FieldLogger, ctx *serveContext) error {
 	}
 
 	listenerConfig := contour.ListenerVisitorConfig{
-		UseProxyProto:     ctx.useProxyProto,
-		HTTPAddress:       ctx.httpAddr,
-		HTTPPort:          ctx.httpPort,
-		HTTPAccessLog:     ctx.httpAccessLog,
-		HTTPSAddress:      ctx.httpsAddr,
-		HTTPSPort:         ctx.httpsPort,
-		HTTPSAccessLog:    ctx.httpsAccessLog,
-		AccessLogType:     ctx.AccessLogFormat,
-		AccessLogFields:   ctx.AccessLogFields,
-		MinimumTLSVersion: annotation.MinTLSVersion(ctx.TLSConfig.MinimumProtocolVersion),
-		RequestTimeout:    ctx.RequestTimeout,
+		UseProxyProto:      ctx.useProxyProto,
+		HTTPAddress:        ctx.httpAddr,
+		HTTPPort:           ctx.httpPort,
+		HTTPAccessLog:      ctx.httpAccessLog,
+		HTTPSAddress:       ctx.httpsAddr,
+		HTTPSPort:          ctx.httpsPort,
+		HTTPSAccessLog:     ctx.httpsAccessLog,
+		AccessLogType:      ctx.AccessLogFormat,
+		AccessLogFields:    ctx.AccessLogFields,
+		MinimumTLSVersion:  annotation.MinTLSVersion(ctx.TLSConfig.MinimumProtocolVersion),
+		DefaultCertificate: defaultCertificate(),
+		RequestTimeout:     ctx.RequestTimeout,
 	}
 
 	defaultHTTPVersions, err := parseDefaultHTTPVersions(ctx.DefaultHTTPVersions)
@@ -349,6 +350,14 @@ func doServe(log logrus.FieldLogger, ctx *serveContext) error {
 		Converter:     converter,
 	}
 	g.Add(lbsw.Start)
+
+	// step 11.5. synchronous cache init (Adobe)
+	// temporarily start the status updater
+	tmpStopChan := make(chan struct{})
+	go sh.Start(tmpStopChan)
+	err = initCache(clients, eventHandler, et)
+	check(err)
+	tmpStopChan <- struct{}{}
 
 	// step 12. register an informer to watch envoy's service if we haven't been given static details.
 	if ctx.IngressStatusAddress == "" {

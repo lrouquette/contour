@@ -16,6 +16,8 @@ package contour
 import (
 	"testing"
 
+	"github.com/projectcontour/contour/adobe"
+
 	projcontour "github.com/projectcontour/contour/apis/projectcontour/v1"
 	"github.com/projectcontour/contour/internal/assert"
 	"github.com/projectcontour/contour/internal/dag"
@@ -46,6 +48,7 @@ func TestHTTPProxyMetrics(t *testing.T) {
 			}
 
 			for _, o := range tc.objs {
+				adobe.AdobefyObject(o)
 				builder.Source.Insert(o)
 			}
 

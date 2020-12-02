@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 
+	ingressroutev1 "github.com/projectcontour/contour/apis/contour/v1beta1"
 	projcontour "github.com/projectcontour/contour/apis/projectcontour/v1"
 )
 
@@ -39,6 +40,11 @@ type StatusCacher struct {
 
 func objectKey(obj interface{}) string {
 	switch obj := obj.(type) {
+	case *ingressroutev1.IngressRoute:
+		return fmt.Sprintf("%s/%s/%s",
+			KindOf(obj),
+			obj.GetObjectMeta().GetNamespace(),
+			obj.GetObjectMeta().GetName())
 	case *projcontour.HTTPProxy:
 		return fmt.Sprintf("%s/%s/%s",
 			KindOf(obj),
@@ -53,7 +59,7 @@ func objectKey(obj interface{}) string {
 // the status cache.
 func (c *StatusCacher) IsCacheable(obj interface{}) bool {
 	switch obj.(type) {
-	case *projcontour.HTTPProxy:
+	case *ingressroutev1.IngressRoute, *projcontour.HTTPProxy:
 		return true
 	default:
 		return false
@@ -108,6 +114,23 @@ func (irs *StatusWriter) GetStatus(obj interface{}) (*projcontour.Status, error)
 // SetStatus sets the HTTPProxy status field to an Valid or Invalid status
 func (irs *StatusWriter) SetStatus(status, desc string, existing interface{}) error {
 	switch exist := existing.(type) {
+	case *ingressroutev1.IngressRoute:
+		irs.Updater.Update(exist.Name,
+			exist.Namespace,
+			ingressroutev1.IngressRouteGVR,
+			StatusMutatorFunc(func(obj interface{}) interface{} {
+				switch o := obj.(type) {
+				case *ingressroutev1.IngressRoute:
+					dco := o.DeepCopy()
+					dco.Status.CurrentStatus = status
+					dco.Status.Description = desc
+					return dco
+				default:
+					panic(fmt.Sprintf("Unsupported object %s/%s in status Address mutator",
+						exist.Namespace, exist.Name,
+					))
+				}
+			}))
 	case *projcontour.HTTPProxy:
 		// StatusUpdateWriters only apply an update if required, so
 		// we don't need to check here.
